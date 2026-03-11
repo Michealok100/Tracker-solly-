@@ -1,20 +1,5 @@
 """
-╔══════════════════════════════════════════════════════════════════════╗
-║          Solana Wallet Flow Tracker — Telegram Bot                   ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║  HOW TO RUN LOCALLY                                                  ║
-║  ──────────────────                                                  ║
-║  1. pip install python-telegram-bot requests base58                  ║
-║  2. python sol_flow_bot.py                                           ║
-║                                                                      ║
-║  HOW TO RUN ON RAILWAY                                               ║
-║  ─────────────────────                                               ║
-║  1. Push all files to a GitHub repo                                  ║
-║  2. Create new Railway project → Deploy from GitHub                  ║
-║  3. Railway auto-deploys and runs 24/7                               ║
-║                                                                      ║
-╚══════════════════════════════════════════════════════════════════════╝
+Solana Wallet Flow Tracker — Telegram Bot
 """
 
 import logging
@@ -23,7 +8,6 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
-import base58
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -36,10 +20,10 @@ SOLANA_RPC_URL = os.environ.get(
     "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"
 )
 
-MAX_SIGNATURES  = 50
+MAX_SIGNATURES  = 30      # reduced to avoid rate limits
 TOP_N           = 5
 LAMPORTS_TO_SOL = 1e-9
-RPC_DELAY       = 0.15
+RPC_DELAY       = 0.5     # increased delay between calls
 RPC_RETRIES     = 3
 
 # ─────────────────────────────────────────────────────────────────────
@@ -56,12 +40,18 @@ logger = logging.getLogger(__name__)
 #  HELPERS
 # ═════════════════════════════════════════════════════════════════════
 
+BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
 def is_valid_solana_address(address: str) -> bool:
-    try:
-        decoded = base58.b58decode(address)
-        return len(decoded) == 32
-    except Exception:
+    """
+    Validate a Solana address without any external library.
+    A valid Solana address is 32-44 characters, base58 characters only.
+    """
+    if not address:
         return False
+    if not (32 <= len(address) <= 44):
+        return False
+    return all(c in BASE58_ALPHABET for c in address)
 
 
 def short(address: str) -> str:
@@ -73,6 +63,7 @@ def short(address: str) -> str:
 # ═════════════════════════════════════════════════════════════════════
 
 def _rpc_post(payload: dict) -> dict:
+    """Send a JSON-RPC call to Solana with retries and back-off."""
     headers    = {"Content-Type": "application/json"}
     last_error = "Unknown error"
 
@@ -80,7 +71,7 @@ def _rpc_post(payload: dict) -> dict:
         time.sleep(RPC_DELAY)
         try:
             resp = requests.post(
-                SOLANA_RPC_URL, json=payload, headers=headers, timeout=20
+                SOLANA_RPC_URL, json=payload, headers=headers, timeout=30
             )
             resp.raise_for_status()
         except requests.RequestException as exc:
@@ -98,11 +89,11 @@ def _rpc_post(payload: dict) -> dict:
 
         if "error" in data:
             err  = data["error"]
-            code = err.get("code", 0)
-            msg  = err.get("message", str(err))
+            code = err.get("code", 0) if isinstance(err, dict) else 0
+            msg  = err.get("message", str(err)) if isinstance(err, dict) else str(err)
             if code == 429 or "rate" in msg.lower():
-                wait = attempt * 3.0
-                logger.warning("RPC rate limited — waiting %.0fs", wait)
+                wait = attempt * 4.0
+                logger.warning("Rate limited — waiting %.0fs", wait)
                 time.sleep(wait)
                 last_error = f"Rate limited: {msg}"
                 continue
@@ -111,12 +102,13 @@ def _rpc_post(payload: dict) -> dict:
         return data
 
     raise RuntimeError(
-        f"Solana RPC failed after {RPC_RETRIES} attempts. Last error: {last_error}\n"
-        "Try again in a moment."
+        f"Solana RPC failed after {RPC_RETRIES} attempts. Last error: {last_error}"
     )
 
 
 def fetch_signatures(wallet: str) -> list:
+    """Fetch recent transaction signatures for a wallet."""
+    logger.info("Fetching signatures for %s from %s", wallet, SOLANA_RPC_URL)
     payload = {
         "jsonrpc": "2.0",
         "id":      1,
@@ -126,15 +118,19 @@ def fetch_signatures(wallet: str) -> list:
     data   = _rpc_post(payload)
     result = data.get("result", [])
     if not isinstance(result, list):
+        logger.warning("Unexpected signatures result: %s", result)
         return []
-    return [
+    sigs = [
         item["signature"]
         for item in result
         if isinstance(item, dict) and item.get("err") is None
     ]
+    logger.info("Got %d valid signatures", len(sigs))
+    return sigs
 
 
 def fetch_transaction(signature: str) -> dict | None:
+    """Fetch full transaction detail for one signature."""
     payload = {
         "jsonrpc": "2.0",
         "id":      1,
@@ -154,28 +150,36 @@ def fetch_transaction(signature: str) -> dict | None:
 # ═════════════════════════════════════════════════════════════════════
 
 def analyse_transfers(wallet: str, signatures: list) -> dict:
+    """
+    Iterate over signatures and detect outgoing SOL transfers
+    by comparing pre/post balances for each account.
+    """
     recipients     = defaultdict(lambda: {"transfers": 0, "sol": 0.0})
     total_sol_sent = 0.0
     txns_analysed  = 0
+    errors         = 0
 
-    for sig in signatures:
+    for i, sig in enumerate(signatures):
+        logger.info("Analysing tx %d/%d: %s", i + 1, len(signatures), sig[:20])
         try:
             tx = fetch_transaction(sig)
         except RuntimeError as exc:
-            logger.warning("Skipping %s: %s", sig, exc)
+            logger.warning("Skipping %s: %s", sig[:20], exc)
+            errors += 1
             continue
 
         if tx is None:
             continue
 
-        meta      = tx.get("meta", {}) or {}
+        meta      = tx.get("meta") or {}
         pre_bals  = meta.get("preBalances", [])
         post_bals = meta.get("postBalances", [])
 
-        transaction = tx.get("transaction", {}) or {}
-        msg         = transaction.get("message", {}) or {}
+        transaction = tx.get("transaction") or {}
+        msg         = transaction.get("message") or {}
         raw_keys    = msg.get("accountKeys", [])
 
+        # Extract account public keys
         accounts = []
         for k in raw_keys:
             if isinstance(k, dict):
@@ -186,32 +190,40 @@ def analyse_transfers(wallet: str, signatures: list) -> dict:
         if not accounts or len(pre_bals) != len(accounts):
             continue
 
-        try:
-            wallet_idx = accounts.index(wallet)
-        except ValueError:
+        # Find the wallet's index in this transaction
+        if wallet not in accounts:
             continue
 
+        wallet_idx   = accounts.index(wallet)
         wallet_delta = post_bals[wallet_idx] - pre_bals[wallet_idx]
+
         if wallet_delta >= 0:
-            continue
+            continue  # not an outgoing transfer
 
         txns_analysed += 1
 
-        for i, (pre, post) in enumerate(zip(pre_bals, post_bals)):
-            if i == wallet_idx:
+        # Find recipients (accounts whose balance increased)
+        for j, (pre, post) in enumerate(zip(pre_bals, post_bals)):
+            if j == wallet_idx:
                 continue
             delta = post - pre
-            if delta > 0 and i < len(accounts) and accounts[i]:
-                recipient     = accounts[i]
-                sol_received  = delta * LAMPORTS_TO_SOL
+            if delta > 0 and j < len(accounts) and accounts[j]:
+                recipient    = accounts[j]
+                sol_received = delta * LAMPORTS_TO_SOL
                 recipients[recipient]["transfers"] += 1
                 recipients[recipient]["sol"]       += sol_received
                 total_sol_sent                     += sol_received
+
+    logger.info(
+        "Analysis complete: %d outgoing txns, %d errors, %d unique recipients",
+        txns_analysed, errors, len(recipients)
+    )
 
     return {
         "recipients":          dict(recipients),
         "total_sol_sent":      total_sol_sent,
         "total_txns_analysed": txns_analysed,
+        "errors":              errors,
     }
 
 
@@ -223,11 +235,13 @@ def format_report(wallet: str, analysis: dict) -> str:
     recipients = analysis["recipients"]
     total_sol  = analysis["total_sol_sent"]
     total_txns = analysis["total_txns_analysed"]
+    errors     = analysis["errors"]
 
     if not recipients:
         return (
             f"🔍 Wallet Analyzed:\n{wallet}\n\n"
-            f"ℹ️ No outgoing SOL transfers detected in the last {MAX_SIGNATURES} transactions."
+            f"ℹ️ No outgoing SOL transfers detected in the last {MAX_SIGNATURES} transactions.\n"
+            f"(Scanned: {MAX_SIGNATURES} txns, errors: {errors})"
         )
 
     ranked = sorted(
@@ -241,7 +255,7 @@ def format_report(wallet: str, analysis: dict) -> str:
     lines = [
         "🔍 Wallet Analyzed:",
         f"  {wallet}",
-        f"  Transactions scanned:    {MAX_SIGNATURES}",
+        f"  Transactions scanned:     {MAX_SIGNATURES}",
         f"  Outgoing transfers found: {total_txns}",
         "",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -295,6 +309,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
+
     if not args:
         await update.message.reply_text(
             "❌ Please provide a Solana wallet address.\n\n"
@@ -303,11 +318,12 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     wallet = args[0].strip()
+    logger.info("Received /trace for wallet: %s", wallet)
 
     if not is_valid_solana_address(wallet):
         await update.message.reply_text(
-            "❌ Invalid Solana wallet address.\n\n"
-            "A Solana address is a base58-encoded string, usually 32–44 characters.\n\n"
+            f"❌ Invalid Solana address: {wallet}\n\n"
+            "Must be 32–44 base58 characters.\n\n"
             "Example:\n"
             "/trace 9xQeWvG816bUx9EPf2nJk9h9v1n6jYtJm6u6H9P9qF1"
         )
@@ -319,17 +335,15 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     try:
-        logger.info("Fetching signatures for %s", wallet)
         signatures = fetch_signatures(wallet)
 
         if not signatures:
             await update.message.reply_text(
                 f"ℹ️ No recent transactions found for:\n{wallet}\n\n"
-                "The wallet may be empty, inactive, or the address may be wrong."
+                "The wallet may be empty or inactive."
             )
             return
 
-        logger.info("Got %d signatures for %s", len(signatures), wallet)
         analysis = analyse_transfers(wallet, signatures)
         report   = format_report(wallet, analysis)
         await update.message.reply_text(report)
@@ -338,13 +352,13 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("RuntimeError for %s: %s", wallet, exc)
         await update.message.reply_text(
             f"❌ RPC Error:\n{exc}\n\n"
-            "💡 The public Solana RPC has rate limits.\n"
-            "Wait 60 seconds and try again."
+            "💡 Make sure SOLANA_RPC_URL is set to your Helius endpoint in Railway Variables.\n"
+            "Get a free key at helius.dev"
         )
     except Exception as exc:
-        logger.exception("Unexpected error for %s", wallet)
+        logger.exception("Unexpected error for %s: %s", wallet, exc)
         await update.message.reply_text(
-            "❌ An unexpected error occurred. Please try again later."
+            f"❌ Unexpected error: {exc}\n\nPlease try again."
         )
 
 
@@ -353,11 +367,12 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ═════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    logger.info("Connecting to Solana RPC: %s", SOLANA_RPC_URL)
+    logger.info("Starting Solana Flow Bot")
+    logger.info("RPC endpoint: %s", SOLANA_RPC_URL)
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("trace", cmd_trace))
-    logger.info("🤖 Solana Flow Bot is running. Press Ctrl+C to stop.")
+    logger.info("🤖 Bot is running. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
